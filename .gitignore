@@ -1,0 +1,54 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Python cache / virtual env
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.venv/
+venv/
+env/
+
+# Python tooling cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Training / experiment outputs
+runs/
+logs/
+checkpoints/
+models/
+weights/
+dataset/
+training_runs/
+test_demo/
+
+# Common model files
+*.pt
+*.pth
+*.onnx
+*.engine
+*.tflite
+
+# Temp files
+*.tmp
+*.log
+
+# Video assets (raw/recorded)
+video/*.mp4
+video/*.avi
+video/*.mov
+video/*.mkv
+video/*.wmv
+video/*.flv
+video/*.mpeg
+video/*.mpg

@@ -1,0 +1,7 @@
+# Install torch/torchvision separately with CUDA wheel index (see README).
+opencv-python>=4.8
+matplotlib>=3.7
+scikit-learn>=1.3
+numpy>=1.24
+Pillow>=10.0
+onnx>=1.14
