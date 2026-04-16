@@ -1,4 +1,6 @@
 # Install torch/torchvision separately with CUDA wheel index (see README).
+# Optional: install mediapipe for more robust hand boxing.
+# Optional: install transformers/ultralytics/accelerate for auto-label and hand detector training.
 opencv-python>=4.8
 matplotlib>=3.7
 scikit-learn>=1.3

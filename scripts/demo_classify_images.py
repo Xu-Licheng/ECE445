@@ -16,10 +16,13 @@ import csv
 import shutil
 from pathlib import Path
 
+import cv2
 import torch
 from PIL import Image
 from torch import nn
 from torchvision import models, transforms
+
+from hand_box_detector import HandBoxDetector
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -57,6 +60,54 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional CSV path. Default: <demo_dir>/predictions.csv",
+    )
+    parser.add_argument(
+        "--hand_detector",
+        type=str,
+        default="auto",
+        choices=["auto", "yolo", "mediapipe", "skin"],
+        help="Hand detector backend used before gesture classification.",
+    )
+    parser.add_argument(
+        "--hand_det_model_path",
+        type=Path,
+        default=None,
+        help="Path to trained YOLO hand detector (.pt/.onnx).",
+    )
+    parser.add_argument(
+        "--hand_det_imgsz",
+        type=int,
+        default=320,
+        help="Input size for YOLO hand detector.",
+    )
+    parser.add_argument(
+        "--hand_det_conf",
+        type=float,
+        default=0.25,
+        help="Confidence threshold for YOLO hand detector.",
+    )
+    parser.add_argument(
+        "--hand_det_iou",
+        type=float,
+        default=0.45,
+        help="NMS IoU threshold for YOLO hand detector.",
+    )
+    parser.add_argument(
+        "--box_expand_ratio",
+        type=float,
+        default=1.25,
+        help="Expand detected hand box by this ratio before cropping.",
+    )
+    parser.add_argument(
+        "--hand_min_area_ratio",
+        type=float,
+        default=0.01,
+        help="Minimum hand area ratio for skin fallback detector.",
+    )
+    parser.add_argument(
+        "--require_hand_box",
+        action="store_true",
+        help="Skip image if no hand box is detected.",
     )
     return parser.parse_args()
 
@@ -115,6 +166,15 @@ def make_eval_transform(image_size: int) -> transforms.Compose:
     )
 
 
+def image_bgr_to_tensor(
+    image_bgr: "cv2.typing.MatLike",
+    transform: transforms.Compose,
+) -> torch.Tensor:
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    image = Image.fromarray(image_rgb)
+    return transform(image).unsqueeze(0)
+
+
 def list_demo_images(demo_dir: Path) -> list[Path]:
     if not demo_dir.exists():
         return []
@@ -156,11 +216,10 @@ def unique_destination(path: Path) -> Path:
 def predict_single(
     model: nn.Module,
     transform: transforms.Compose,
-    image_path: Path,
+    image_bgr: "cv2.typing.MatLike",
     device: torch.device,
 ) -> tuple[int, float]:
-    image = Image.open(image_path).convert("RGB")
-    tensor = transform(image).unsqueeze(0).to(device)
+    tensor = image_bgr_to_tensor(image_bgr, transform).to(device)
 
     with torch.no_grad():
         logits = model(tensor)
@@ -176,6 +235,15 @@ def main() -> None:
 
     model, class_names, image_size = load_checkpoint(args.model_path, device)
     transform = make_eval_transform(image_size)
+    hand_detector = HandBoxDetector(
+        detector=args.hand_detector,
+        yolo_model_path=args.hand_det_model_path,
+        yolo_imgsz=args.hand_det_imgsz,
+        yolo_conf=args.hand_det_conf,
+        yolo_iou=args.hand_det_iou,
+        box_expand_ratio=args.box_expand_ratio,
+        min_area_ratio=args.hand_min_area_ratio,
+    )
 
     class_dirs = ensure_class_dirs(args.demo_dir, class_names)
     image_paths = list_demo_images(args.demo_dir)
@@ -192,16 +260,52 @@ def main() -> None:
     output_csv.parent.mkdir(parents=True, exist_ok=True)
 
     summary_count: dict[str, int] = {name: 0 for name in class_names}
+    skipped_no_hand = 0
 
     with output_csv.open("w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
-        writer.writerow(["image_name", "pred_class", "confidence", "source_path", "output_path"])
+        writer.writerow(
+            [
+                "image_name",
+                "pred_class",
+                "confidence",
+                "hand_box_found",
+                "box_x1",
+                "box_y1",
+                "box_x2",
+                "box_y2",
+                "detector",
+                "source_path",
+                "output_path",
+            ]
+        )
 
         for image_path in image_paths:
+            frame = cv2.imread(str(image_path))
+            if frame is None:
+                print(f"[WARN] Cannot read image: {image_path}")
+                continue
+
+            box_result = hand_detector.detect(frame)
+            hand_box = box_result.box
+
+            if hand_box is None and args.require_hand_box:
+                skipped_no_hand += 1
+                print(f"[SKIP] No hand box: {image_path.name}")
+                continue
+
+            if hand_box is None:
+                roi = frame
+                box_vals = ("", "", "", "")
+            else:
+                x1, y1, x2, y2 = hand_box
+                roi = frame[y1:y2, x1:x2]
+                box_vals = (x1, y1, x2, y2)
+
             pred_idx, confidence = predict_single(
                 model=model,
                 transform=transform,
-                image_path=image_path,
+                image_bgr=roi,
                 device=device,
             )
             pred_class = class_names[pred_idx]
@@ -218,21 +322,33 @@ def main() -> None:
                     image_path.name,
                     pred_class,
                     f"{confidence:.6f}",
+                    bool(hand_box is not None),
+                    box_vals[0],
+                    box_vals[1],
+                    box_vals[2],
+                    box_vals[3],
+                    box_result.method,
                     str(image_path),
                     str(destination),
                 ]
             )
 
-            print(f"[PRED] {image_path.name} -> {pred_class} ({confidence:.4f})")
+            if hand_box is None:
+                print(f"[PRED] {image_path.name} -> {pred_class} ({confidence:.4f}) [full image]")
+            else:
+                print(f"[PRED] {image_path.name} -> {pred_class} ({confidence:.4f}) [hand box]")
 
     print("\n[DONE] Demo inference finished")
     print(f"Model   : {args.model_path}")
     print(f"Device  : {device}")
+    print(f"Detector: {hand_detector.active_detector}")
     print(f"Demo dir: {args.demo_dir}")
     print(f"CSV     : {output_csv}")
     print("[SUMMARY]")
     for class_name in class_names:
         print(f"- {class_name}: {summary_count[class_name]}")
+    if skipped_no_hand > 0:
+        print(f"- skipped(no hand box): {skipped_no_hand}")
 
 
 if __name__ == "__main__":

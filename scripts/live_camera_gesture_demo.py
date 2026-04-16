@@ -3,7 +3,8 @@
 
 Usage example:
 python scripts/live_camera_gesture_demo.py \
-    --model_path training_runs/run_xxx/best_model.pth \
+    --gesture_model_path training_runs/run_gesture/best_model.pth \
+    --hand_det_model_path training_runs_hand_det/run_hand_det/weights/best.pt \
     --device cuda:0
 """
 
@@ -20,16 +21,30 @@ from PIL import Image
 from torch import nn
 from torchvision import models, transforms
 
+from hand_box_detector import HandBoxDetector
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Real-time gesture classifier demo using webcam."
+        description="Real-time dual-model demo: hand detector + gesture classifier."
+    )
+    parser.add_argument(
+        "--gesture_model_path",
+        type=Path,
+        default=None,
+        help="Gesture classifier checkpoint (.pth). If omitted, auto-pick latest from training_runs.",
     )
     parser.add_argument(
         "--model_path",
         type=Path,
-        required=True,
-        help="Path to trained checkpoint (.pth), e.g. training_runs/run_xxx/best_model.pth",
+        default=None,
+        help="Deprecated alias of --gesture_model_path for backward compatibility.",
+    )
+    parser.add_argument(
+        "--hand_det_model_path",
+        type=Path,
+        default=None,
+        help="YOLO hand detector model path (.pt/.onnx). If omitted, auto-pick latest best.pt under training_runs_hand_det.",
     )
     parser.add_argument(
         "--device",
@@ -67,7 +82,68 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Mirror camera image horizontally for a selfie-like preview.",
     )
+    parser.add_argument(
+        "--hand_det_imgsz",
+        type=int,
+        default=320,
+        help="Input size for YOLO hand detector.",
+    )
+    parser.add_argument(
+        "--hand_det_conf",
+        type=float,
+        default=0.25,
+        help="Confidence threshold for YOLO hand detector.",
+    )
+    parser.add_argument(
+        "--hand_det_iou",
+        type=float,
+        default=0.45,
+        help="NMS IoU threshold for YOLO hand detector.",
+    )
+    parser.add_argument(
+        "--box_expand_ratio",
+        type=float,
+        default=1.25,
+        help="Expand detected hand box by this ratio before cropping.",
+    )
+    parser.add_argument(
+        "--no_hand_label",
+        type=str,
+        default="no_hand",
+        help="Overlay label when no hand box is detected.",
+    )
     return parser.parse_args()
+
+
+def resolve_gesture_model_path(args: argparse.Namespace) -> Path:
+    if args.gesture_model_path is not None:
+        return args.gesture_model_path
+    if args.model_path is not None:
+        return args.model_path
+
+    candidates = sorted(Path("training_runs").glob("*/best_model.pth"), key=lambda p: p.stat().st_mtime)
+    if not candidates:
+        raise FileNotFoundError(
+            "Cannot find gesture model automatically. "
+            "Pass --gesture_model_path explicitly or train gesture model first."
+        )
+    return candidates[-1]
+
+
+def resolve_hand_det_model_path(args: argparse.Namespace) -> Path:
+    if args.hand_det_model_path is not None:
+        return args.hand_det_model_path
+
+    candidates = sorted(
+        Path("training_runs_hand_det").glob("*/weights/best.pt"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if not candidates:
+        raise FileNotFoundError(
+            "Cannot find hand detector model automatically. "
+            "Pass --hand_det_model_path explicitly or train hand detector first."
+        )
+    return candidates[-1]
 
 
 def resolve_device(device_arg: str) -> torch.device:
@@ -149,11 +225,13 @@ def draw_overlay(
     confidence: float,
     fps: float,
     device: torch.device,
+    detector_name: str,
+    hand_box_found: bool,
 ) -> "cv2.typing.MatLike":
     frame = frame_bgr.copy()
     h, w = frame.shape[:2]
 
-    bar_h = 90
+    bar_h = 112
     cv2.rectangle(frame, (0, 0), (w, bar_h), (0, 0, 0), thickness=-1)
     cv2.putText(
         frame,
@@ -185,6 +263,16 @@ def draw_overlay(
         2,
         cv2.LINE_AA,
     )
+    cv2.putText(
+        frame,
+        f"Box: {'yes' if hand_box_found else 'no'} | Detector: {detector_name}",
+        (12, 104),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
     return frame
 
 
@@ -195,9 +283,20 @@ def main() -> None:
     if not (0.0 <= args.min_confidence <= 1.0):
         raise ValueError("--min_confidence must be in [0, 1]")
 
+    gesture_model_path = resolve_gesture_model_path(args)
+    hand_det_model_path = resolve_hand_det_model_path(args)
+
     device = resolve_device(args.device)
-    model, class_names, image_size = load_checkpoint(args.model_path, device)
+    model, class_names, image_size = load_checkpoint(gesture_model_path, device)
     transform = make_eval_transform(image_size)
+    hand_detector = HandBoxDetector(
+        detector="yolo",
+        yolo_model_path=hand_det_model_path,
+        yolo_imgsz=args.hand_det_imgsz,
+        yolo_conf=args.hand_det_conf,
+        yolo_iou=args.hand_det_iou,
+        box_expand_ratio=args.box_expand_ratio,
+    )
 
     cap = cv2.VideoCapture(args.camera_index)
     if not cap.isOpened():
@@ -207,9 +306,11 @@ def main() -> None:
         )
 
     print("[INFO] Live demo started")
-    print(f"[INFO] Model : {args.model_path}")
+    print(f"[INFO] Gesture model: {gesture_model_path}")
+    print(f"[INFO] Hand model   : {hand_det_model_path}")
     print(f"[INFO] Device: {device}")
     print(f"[INFO] Classes: {class_names}")
+    print(f"[INFO] Detector: {hand_detector.active_detector}")
     print("[INFO] Press 'q' or ESC to quit")
 
     prob_history: deque[torch.Tensor] = deque(maxlen=args.smoothing_window)
@@ -225,23 +326,53 @@ def main() -> None:
             if args.mirror:
                 frame = cv2.flip(frame, 1)
 
-            probs = predict_probs(model, frame, transform, device)
-            prob_history.append(probs)
+            box_result = hand_detector.detect(frame)
+            hand_box = box_result.box
 
-            smooth_probs = torch.stack(list(prob_history), dim=0).mean(dim=0)
-            pred_idx = int(torch.argmax(smooth_probs).item())
-            confidence = float(smooth_probs[pred_idx].item())
-
-            if confidence < args.min_confidence:
-                label = "uncertain"
+            if hand_box is None:
+                prob_history.clear()
+                label = args.no_hand_label
+                confidence = 0.0
             else:
-                label = class_names[pred_idx]
+                x1, y1, x2, y2 = hand_box
+                hand_roi = frame[y1:y2, x1:x2]
+                probs = predict_probs(model, hand_roi, transform, device)
+                prob_history.append(probs)
+
+                smooth_probs = torch.stack(list(prob_history), dim=0).mean(dim=0)
+                pred_idx = int(torch.argmax(smooth_probs).item())
+                confidence = float(smooth_probs[pred_idx].item())
+
+                if confidence < args.min_confidence:
+                    label = "uncertain"
+                else:
+                    label = class_names[pred_idx]
+
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                cv2.putText(
+                    frame,
+                    f"hand box ({box_result.method})",
+                    (x1, max(20, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
 
             now = time.perf_counter()
             fps = 1.0 / max(now - prev_time, 1e-6)
             prev_time = now
 
-            vis_frame = draw_overlay(frame, label, confidence, fps, device)
+            vis_frame = draw_overlay(
+                frame,
+                label,
+                confidence,
+                fps,
+                device,
+                hand_detector.active_detector,
+                hand_box is not None,
+            )
             cv2.imshow(args.window_name, vis_frame)
 
             key = cv2.waitKey(1) & 0xFF

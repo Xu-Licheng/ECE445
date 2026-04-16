@@ -31,6 +31,9 @@ weights/
 dataset/
 training_runs/
 test_demo/
+training_runs_hand_det/
+deploy/
+artifacts/
 
 # Common model files
 *.pt
