@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Build an image dataset by extracting frames from gesture videos.
 
-Each video file under --video_dir is treated as one class. Frames are written to
---output_dir/<class_name>/ and metadata is saved to CSV files.
+Preferred layout:
+    --video_dir/<class_name>/*.mp4
+
+All videos under the same class folder are merged into one class in the output
+dataset. For backward compatibility, a flat layout where each root video file
+is one class is also supported.
 """
 
 from __future__ import annotations
@@ -36,7 +40,11 @@ def parse_args() -> argparse.Namespace:
         "--video_dir",
         type=Path,
         default=Path("video"),
-        help="Directory containing source videos. One video equals one class.",
+        help=(
+            "Video root directory. Preferred: video/<class_name>/*.mp4 "
+            "(one folder per class, multiple videos allowed). "
+            "Backward-compatible flat layout is also supported."
+        ),
     )
     parser.add_argument(
         "--output_dir",
@@ -105,24 +113,77 @@ def sanitize_label(name: str) -> str:
     return label or "class"
 
 
+def is_supported_video(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS
+
+
 def list_videos(video_dir: Path) -> list[Path]:
     if not video_dir.exists():
         raise FileNotFoundError(f"Video directory does not exist: {video_dir}")
-    videos = [
-        path
-        for path in video_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS
-    ]
+    videos = [path for path in video_dir.iterdir() if is_supported_video(path)]
     return sorted(videos)
+
+
+def list_videos_recursive(root: Path) -> list[Path]:
+    return sorted(path for path in root.rglob("*") if is_supported_video(path))
+
+
+def ensure_unique_labels(raw_names: list[str], source_kind: str) -> None:
+    label_to_raw: dict[str, list[str]] = {}
+    for raw in raw_names:
+        label = sanitize_label(raw)
+        label_to_raw.setdefault(label, []).append(raw)
+
+    duplicated = {label: names for label, names in label_to_raw.items() if len(names) > 1}
+    if duplicated:
+        details = "; ".join(
+            f"{label} <- {', '.join(names)}" for label, names in sorted(duplicated.items())
+        )
+        raise ValueError(
+            f"Detected duplicated class labels after sanitization for {source_kind}: {details}"
+        )
+
+
+def discover_class_sources(video_dir: Path) -> tuple[list[tuple[str, list[Path]]], str]:
+    if not video_dir.exists():
+        raise FileNotFoundError(f"Video directory does not exist: {video_dir}")
+
+    class_dirs = sorted(path for path in video_dir.iterdir() if path.is_dir())
+    folder_sources: list[tuple[str, list[Path]]] = []
+    for class_dir in class_dirs:
+        videos = list_videos_recursive(class_dir)
+        if videos:
+            folder_sources.append((class_dir.name, videos))
+
+    if folder_sources:
+        ensure_unique_labels([name for name, _ in folder_sources], "class folders")
+        class_sources = [
+            (sanitize_label(class_name), videos)
+            for class_name, videos in sorted(folder_sources, key=lambda item: item[0].lower())
+        ]
+        return class_sources, "folder"
+
+    flat_videos = list_videos(video_dir)
+    if flat_videos:
+        ensure_unique_labels([video.stem for video in flat_videos], "video filenames")
+        class_sources = [(sanitize_label(video.stem), [video]) for video in flat_videos]
+        return class_sources, "flat"
+
+    raise RuntimeError(
+        "No supported videos found. Expected either "
+        "video/<class_name>/*.mp4 (preferred) or flat videos directly under video/."
+    )
 
 
 def main() -> None:
     args = parse_args()
     validate_args(args)
 
-    video_files = list_videos(args.video_dir)
-    if not video_files:
-        raise RuntimeError(f"No supported videos found in: {args.video_dir}")
+    class_sources, source_mode = discover_class_sources(args.video_dir)
+    if source_mode == "folder":
+        print("[INFO] Using folder-based class discovery: video/<class_name>/*.mp4")
+    else:
+        print("[INFO] Using flat class discovery (backward compatibility mode).")
 
     if args.overwrite and args.output_dir.exists():
         shutil.rmtree(args.output_dir)
@@ -133,6 +194,7 @@ def main() -> None:
     summary_path = args.output_dir / "extract_summary.csv"
 
     total_saved = 0
+    class_saved_counts: dict[str, int] = {class_name: 0 for class_name, _ in class_sources}
     summary_rows: list[tuple[str, str, int]] = []
 
     with manifest_path.open("w", newline="", encoding="utf-8") as manifest_file:
@@ -140,91 +202,113 @@ def main() -> None:
         writer.writerow(
             [
                 "class_name",
-                "video_file",
+                "video_rel_path",
                 "frame_index",
                 "timestamp_sec",
                 "image_path",
             ]
         )
 
-        for video_path in video_files:
-            class_name = sanitize_label(video_path.stem)
+        for class_name, class_videos in class_sources:
             class_dir = args.output_dir / class_name
             class_dir.mkdir(parents=True, exist_ok=True)
 
-            cap = cv2.VideoCapture(str(video_path))
-            if not cap.isOpened():
-                print(f"[WARN] Cannot open video: {video_path}")
-                continue
+            for video_path in class_videos:
+                cap = cv2.VideoCapture(str(video_path))
+                if not cap.isOpened():
+                    print(f"[WARN] Cannot open video: {video_path}")
+                    continue
 
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            if fps <= 0:
-                fps = 30.0
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                if fps <= 0:
+                    fps = 30.0
 
-            frame_index = 0
-            saved_count = 0
+                frame_index = 0
+                saved_from_video = 0
 
-            while True:
-                ok, frame = cap.read()
-                if not ok:
-                    break
-
-                if frame_index % args.sample_every_n_frames == 0:
-                    if args.resize_width > 0 and args.resize_height > 0:
-                        frame = cv2.resize(
-                            frame,
-                            (args.resize_width, args.resize_height),
-                            interpolation=cv2.INTER_AREA,
-                        )
-
-                    image_name = f"{class_name}_{saved_count:06d}.{args.image_ext}"
-                    image_path = class_dir / image_name
-
-                    if args.image_ext == "jpg":
-                        write_ok = cv2.imwrite(
-                            str(image_path),
-                            frame,
-                            [int(cv2.IMWRITE_JPEG_QUALITY), args.jpg_quality],
-                        )
-                    else:
-                        write_ok = cv2.imwrite(str(image_path), frame)
-
-                    if write_ok:
-                        timestamp_sec = frame_index / fps
-                        relative_image_path = image_path.relative_to(args.output_dir)
-                        writer.writerow(
-                            [
-                                class_name,
-                                video_path.name,
-                                frame_index,
-                                f"{timestamp_sec:.6f}",
-                                str(relative_image_path).replace("\\", "/"),
-                            ]
-                        )
-                        saved_count += 1
-                        total_saved += 1
-                    else:
-                        print(f"[WARN] Failed to write image: {image_path}")
-
-                    if (
-                        args.max_frames_per_class > 0
-                        and saved_count >= args.max_frames_per_class
-                    ):
+                while True:
+                    ok, frame = cap.read()
+                    if not ok:
                         break
 
-                frame_index += 1
+                    if frame_index % args.sample_every_n_frames == 0:
+                        if (
+                            args.max_frames_per_class > 0
+                            and class_saved_counts[class_name] >= args.max_frames_per_class
+                        ):
+                            break
 
-            cap.release()
+                        if args.resize_width > 0 and args.resize_height > 0:
+                            frame = cv2.resize(
+                                frame,
+                                (args.resize_width, args.resize_height),
+                                interpolation=cv2.INTER_AREA,
+                            )
 
-            summary_rows.append((class_name, video_path.name, saved_count))
-            print(
-                f"[INFO] {video_path.name} -> class '{class_name}', "
-                f"saved {saved_count} images"
-            )
+                        image_name = (
+                            f"{class_name}_{class_saved_counts[class_name]:06d}.{args.image_ext}"
+                        )
+                        image_path = class_dir / image_name
+
+                        if args.image_ext == "jpg":
+                            write_ok = cv2.imwrite(
+                                str(image_path),
+                                frame,
+                                [int(cv2.IMWRITE_JPEG_QUALITY), args.jpg_quality],
+                            )
+                        else:
+                            write_ok = cv2.imwrite(str(image_path), frame)
+
+                        if write_ok:
+                            timestamp_sec = frame_index / fps
+                            relative_image_path = image_path.relative_to(args.output_dir)
+                            relative_video_path = video_path.relative_to(args.video_dir)
+                            writer.writerow(
+                                [
+                                    class_name,
+                                    str(relative_video_path).replace("\\", "/"),
+                                    frame_index,
+                                    f"{timestamp_sec:.6f}",
+                                    str(relative_image_path).replace("\\", "/"),
+                                ]
+                            )
+                            saved_from_video += 1
+                            class_saved_counts[class_name] += 1
+                            total_saved += 1
+                        else:
+                            print(f"[WARN] Failed to write image: {image_path}")
+
+                    frame_index += 1
+
+                cap.release()
+
+                relative_video_path = video_path.relative_to(args.video_dir)
+                summary_rows.append(
+                    (
+                        class_name,
+                        str(relative_video_path).replace("\\", "/"),
+                        saved_from_video,
+                    )
+                )
+                print(
+                    f"[INFO] {relative_video_path} -> class '{class_name}', "
+                    f"saved {saved_from_video} images "
+                    f"(class total: {class_saved_counts[class_name]})"
+                )
+
+                if (
+                    args.max_frames_per_class > 0
+                    and class_saved_counts[class_name] >= args.max_frames_per_class
+                ):
+                    print(
+                        f"[INFO] Reached max_frames_per_class={args.max_frames_per_class} "
+                        f"for class '{class_name}', skipping remaining videos in this class."
+                    )
+                    break
 
     with summary_path.open("w", newline="", encoding="utf-8") as summary_file:
         writer = csv.writer(summary_file)
-        writer.writerow(["class_name", "video_file", "saved_images"])
+        writer.writerow(["class_name", "video_rel_path", "saved_images"])
         writer.writerows(summary_rows)
 
     print(f"[DONE] Dataset extraction finished. Total images: {total_saved}")

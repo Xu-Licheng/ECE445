@@ -29,6 +29,8 @@ checkpoints/
 models/
 weights/
 dataset/
+data/
+datasets/
 training_runs/
 test_demo/
 training_runs_hand_det/
@@ -41,17 +43,35 @@ artifacts/
 *.onnx
 *.engine
 *.tflite
+*.kmodel
+*.bin
 
 # Temp files
+tmp/
+temp/
+tmp_*/
 *.tmp
 *.log
 
-# Video assets (raw/recorded)
-video/*.mp4
-video/*.avi
-video/*.mov
-video/*.mkv
-video/*.wmv
-video/*.flv
-video/*.mpeg
-video/*.mpg
+# Data archives / exports
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# Media assets (raw/recorded data)
+video/
+videos/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wmv
+*.flv
+*.mpeg
+*.mpg
+*.jpg
+*.jpeg
+*.png

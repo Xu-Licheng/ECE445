@@ -1,9 +1,23 @@
-# Install torch/torchvision separately with CUDA wheel index (see README).
-# Optional: install mediapipe for more robust hand boxing.
-# Optional: install transformers/ultralytics/accelerate for auto-label and hand detector training.
+# One-shot install for end-to-end pipeline:
+# - frame extraction / training / eval
+# - GroundingDINO auto-labeling
+# - YOLO hand-detector training
+# - ONNX export
+#
+# If you need a specific CUDA build, reinstall torch/torchvision afterwards
+# with the wheel index command in README.
+numpy>=1.24
+Pillow>=10.0
 opencv-python>=4.8
 matplotlib>=3.7
 scikit-learn>=1.3
-numpy>=1.24
-Pillow>=10.0
 onnx>=1.14
+
+# Core DL stack
+torch
+torchvision
+
+# Dual-model pipeline dependencies
+ultralytics
+transformers
+accelerate

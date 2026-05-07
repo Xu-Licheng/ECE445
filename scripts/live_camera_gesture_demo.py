@@ -21,6 +21,7 @@ from PIL import Image
 from torch import nn
 from torchvision import models, transforms
 
+from gesture_debounce import GestureDebounceConfig, GestureDebouncer
 from hand_box_detector import HandBoxDetector
 
 
@@ -73,8 +74,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min_confidence",
         type=float,
-        default=0.0,
-        help="If confidence is below this threshold, label as uncertain.",
+        default=0.6,
+        help="Minimum top-1 confidence required to enter a new gesture output.",
+    )
+    parser.add_argument(
+        "--hold_confidence",
+        type=float,
+        default=None,
+        help="Lower hysteresis threshold for keeping the current gesture. Default: min_confidence - 0.10.",
+    )
+    parser.add_argument(
+        "--min_top_margin",
+        type=float,
+        default=0.10,
+        help="Minimum probability gap between top-1 and top-2 classes.",
+    )
+    parser.add_argument(
+        "--stable_frames",
+        type=int,
+        default=3,
+        help="Require the same valid top-1 class for this many frames before output.",
+    )
+    parser.add_argument(
+        "--min_response_seconds",
+        type=float,
+        default=0.5,
+        help="Minimum time between output label changes.",
+    )
+    parser.add_argument(
+        "--hold_last_seconds",
+        type=float,
+        default=0.3,
+        help="Keep the last valid gesture for this long when the current prediction is uncertain.",
+    )
+    parser.add_argument(
+        "--no_hand_timeout_seconds",
+        type=float,
+        default=0.2,
+        help="Keep the last output during short hand-box dropouts before showing no_hand_label.",
+    )
+    parser.add_argument(
+        "--default_label",
+        type=str,
+        default="default",
+        help="Fallback label for low confidence when uncertain_label is not one of the trained classes.",
+    )
+    parser.add_argument(
+        "--uncertain_label",
+        type=str,
+        default="uncertain",
+        help="Use this label for low-confidence output if it exists in the checkpoint class list.",
     )
     parser.add_argument(
         "--mirror",
@@ -113,6 +162,50 @@ def parse_args() -> argparse.Namespace:
         help="Overlay label when no hand box is detected.",
     )
     return parser.parse_args()
+
+
+def resolve_hold_confidence(args: argparse.Namespace) -> float:
+    if args.hold_confidence is not None:
+        return args.hold_confidence
+    return max(0.0, args.min_confidence - 0.10)
+
+
+def resolve_low_confidence_label(
+    class_names: list[str],
+    uncertain_label: str,
+    default_label: str,
+) -> str:
+    if uncertain_label in class_names:
+        return uncertain_label
+    return default_label
+
+
+def validate_debounce_args(args: argparse.Namespace) -> None:
+    hold_confidence = resolve_hold_confidence(args)
+    if args.smoothing_window < 1:
+        raise ValueError("--smoothing_window must be >= 1")
+    if not (0.0 <= args.min_confidence <= 1.0):
+        raise ValueError("--min_confidence must be in [0, 1]")
+    if not (0.0 <= hold_confidence <= 1.0):
+        raise ValueError("--hold_confidence must be in [0, 1]")
+    if hold_confidence > args.min_confidence:
+        raise ValueError("--hold_confidence must be <= --min_confidence")
+    if not (0.0 <= args.min_top_margin <= 1.0):
+        raise ValueError("--min_top_margin must be in [0, 1]")
+    if args.stable_frames < 1:
+        raise ValueError("--stable_frames must be >= 1")
+    if args.min_response_seconds < 0.0:
+        raise ValueError("--min_response_seconds must be >= 0")
+    if args.hold_last_seconds < 0.0:
+        raise ValueError("--hold_last_seconds must be >= 0")
+    if args.no_hand_timeout_seconds < 0.0:
+        raise ValueError("--no_hand_timeout_seconds must be >= 0")
+    if not args.default_label:
+        raise ValueError("--default_label must be non-empty")
+    if not args.no_hand_label:
+        raise ValueError("--no_hand_label must be non-empty")
+    if not args.uncertain_label:
+        raise ValueError("--uncertain_label must be non-empty")
 
 
 def resolve_gesture_model_path(args: argparse.Namespace) -> Path:
@@ -219,6 +312,19 @@ def predict_probs(
     return probs.squeeze(0).detach().cpu()
 
 
+def top_two_prediction(
+    probs: torch.Tensor,
+    class_names: list[str],
+) -> tuple[str, float, float]:
+    top_count = min(2, int(probs.numel()))
+    top_values, top_indices = torch.topk(probs, k=top_count)
+
+    pred_idx = int(top_indices[0].item())
+    confidence = float(top_values[0].item())
+    second_confidence = float(top_values[1].item()) if top_count > 1 else 0.0
+    return class_names[pred_idx], confidence, second_confidence
+
+
 def draw_overlay(
     frame_bgr: "cv2.typing.MatLike",
     label: str,
@@ -278,16 +384,32 @@ def draw_overlay(
 
 def main() -> None:
     args = parse_args()
-    if args.smoothing_window < 1:
-        raise ValueError("--smoothing_window must be >= 1")
-    if not (0.0 <= args.min_confidence <= 1.0):
-        raise ValueError("--min_confidence must be in [0, 1]")
+    validate_debounce_args(args)
 
     gesture_model_path = resolve_gesture_model_path(args)
     hand_det_model_path = resolve_hand_det_model_path(args)
 
     device = resolve_device(args.device)
     model, class_names, image_size = load_checkpoint(gesture_model_path, device)
+    hold_confidence = resolve_hold_confidence(args)
+    low_confidence_label = resolve_low_confidence_label(
+        class_names=class_names,
+        uncertain_label=args.uncertain_label,
+        default_label=args.default_label,
+    )
+    debouncer = GestureDebouncer(
+        GestureDebounceConfig(
+            min_confidence=args.min_confidence,
+            hold_confidence=hold_confidence,
+            min_top_margin=args.min_top_margin,
+            stable_frames=args.stable_frames,
+            min_response_seconds=args.min_response_seconds,
+            hold_last_seconds=args.hold_last_seconds,
+            no_hand_timeout_seconds=args.no_hand_timeout_seconds,
+            low_confidence_label=low_confidence_label,
+            no_hand_label=args.no_hand_label,
+        )
+    )
     transform = make_eval_transform(image_size)
     hand_detector = HandBoxDetector(
         detector="yolo",
@@ -311,6 +433,17 @@ def main() -> None:
     print(f"[INFO] Device: {device}")
     print(f"[INFO] Classes: {class_names}")
     print(f"[INFO] Detector: {hand_detector.active_detector}")
+    print(
+        "[INFO] Debounce: "
+        f"min_conf={args.min_confidence:.2f}, "
+        f"hold_conf={hold_confidence:.2f}, "
+        f"top_margin={args.min_top_margin:.2f}, "
+        f"stable_frames={args.stable_frames}, "
+        f"min_response={args.min_response_seconds:.2f}s, "
+        f"hold_last={args.hold_last_seconds:.2f}s, "
+        f"no_hand_timeout={args.no_hand_timeout_seconds:.2f}s, "
+        f"low_conf_label={low_confidence_label}"
+    )
     print("[INFO] Press 'q' or ESC to quit")
 
     prob_history: deque[torch.Tensor] = deque(maxlen=args.smoothing_window)
@@ -330,9 +463,16 @@ def main() -> None:
             hand_box = box_result.box
 
             if hand_box is None:
-                prob_history.clear()
-                label = args.no_hand_label
-                confidence = 0.0
+                now = time.perf_counter()
+                debounce_result = debouncer.update(
+                    raw_label=None,
+                    raw_confidence=0.0,
+                    second_confidence=0.0,
+                    hand_detected=False,
+                    now=now,
+                )
+                if debounce_result.hand_missing_timed_out:
+                    prob_history.clear()
             else:
                 x1, y1, x2, y2 = hand_box
                 hand_roi = frame[y1:y2, x1:x2]
@@ -340,13 +480,18 @@ def main() -> None:
                 prob_history.append(probs)
 
                 smooth_probs = torch.stack(list(prob_history), dim=0).mean(dim=0)
-                pred_idx = int(torch.argmax(smooth_probs).item())
-                confidence = float(smooth_probs[pred_idx].item())
-
-                if confidence < args.min_confidence:
-                    label = "uncertain"
-                else:
-                    label = class_names[pred_idx]
+                raw_label, raw_confidence, second_confidence = top_two_prediction(
+                    smooth_probs,
+                    class_names,
+                )
+                now = time.perf_counter()
+                debounce_result = debouncer.update(
+                    raw_label=raw_label,
+                    raw_confidence=raw_confidence,
+                    second_confidence=second_confidence,
+                    hand_detected=True,
+                    now=now,
+                )
 
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
                 cv2.putText(
@@ -360,14 +505,13 @@ def main() -> None:
                     cv2.LINE_AA,
                 )
 
-            now = time.perf_counter()
             fps = 1.0 / max(now - prev_time, 1e-6)
             prev_time = now
 
             vis_frame = draw_overlay(
                 frame,
-                label,
-                confidence,
+                debounce_result.label,
+                debounce_result.confidence,
                 fps,
                 device,
                 hand_detector.active_detector,
